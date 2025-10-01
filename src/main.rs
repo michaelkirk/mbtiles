@@ -92,9 +92,6 @@ impl BoundingBox {
 fn extract_tiles(input_path: &str, output_path: &str, bbox_str: &str) -> Result<()> {
     let bbox = BoundingBox::parse(bbox_str)?;
 
-    let input_conn = Connection::open(input_path)
-        .context(format!("Failed to open input file: {}", input_path))?;
-
     let output_conn = Connection::open(output_path)
         .context(format!("Failed to create output file: {}", output_path))?;
 
@@ -105,58 +102,39 @@ fn extract_tiles(input_path: &str, output_path: &str, bbox_str: &str) -> Result<
          CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);"
     )?;
 
+    // Attach input database
+    output_conn.execute(
+        "ATTACH DATABASE ? AS input",
+        rusqlite::params![input_path]
+    )?;
+
     // Copy metadata
-    {
-        let mut stmt = input_conn.prepare("SELECT name, value FROM metadata")?;
-        let mut insert_meta = output_conn.prepare("INSERT INTO metadata (name, value) VALUES (?, ?)")?;
-
-        let metadata = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-
-        for meta in metadata {
-            let (name, value) = meta?;
-            insert_meta.execute([&name, &value])?;
-        }
-    }
+    output_conn.execute(
+        "INSERT INTO metadata SELECT name, value FROM input.metadata",
+        []
+    )?;
 
     // Get all zoom levels present in the database
     let zoom_levels: Vec<i32> = {
-        let mut stmt = input_conn.prepare("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")?;
+        let mut stmt = output_conn.prepare("SELECT DISTINCT zoom_level FROM input.tiles ORDER BY zoom_level")?;
         stmt.query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
 
     // Extract and copy tiles within bounding box for each zoom level
-    let tx = output_conn.unchecked_transaction()?;
-    let mut select_stmt = input_conn.prepare(
-        "SELECT tile_column, tile_row, tile_data FROM tiles
-         WHERE zoom_level = ? AND tile_column BETWEEN ? AND ? AND tile_row BETWEEN ? AND ?"
-    )?;
-    let mut insert_tile = tx.prepare(
-        "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)"
-    )?;
-
     let mut copied = 0;
     for zoom in zoom_levels {
         let (x_min, x_max, y_min, y_max) = bbox.tile_bounds(zoom);
 
-        let tiles = select_stmt.query_map(rusqlite::params![zoom, x_min, x_max, y_min, y_max], |row| {
-            Ok((
-                row.get::<_, i32>(0)?,
-                row.get::<_, i32>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-
-        for tile in tiles {
-            let (x, y, data) = tile?;
-            insert_tile.execute(rusqlite::params![zoom, x, y, data])?;
-            copied += 1;
-        }
+        let rows = output_conn.execute(
+            "INSERT INTO tiles SELECT zoom_level, tile_column, tile_row, tile_data FROM input.tiles
+             WHERE zoom_level = ? AND tile_column BETWEEN ? AND ? AND tile_row BETWEEN ? AND ?",
+            rusqlite::params![zoom, x_min, x_max, y_min, y_max]
+        )?;
+        copied += rows;
     }
-    drop(insert_tile);
-    tx.commit()?;
+
+    output_conn.execute("DETACH DATABASE input", [])?;
 
     println!("Extraction complete: {} tiles copied", copied);
 
